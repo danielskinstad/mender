@@ -575,9 +575,9 @@ expected::ExpectedBytes SignGeneric(PrivateKey &private_key, const vector<uint8_
 	vector<uint8_t> signature {};
 
 	// Set the needed signature buffer length
-	size_t digestlength = MENDER_DIGEST_SHA256_LENGTH, siglength;
-	if (EVP_PKEY_sign(pkey_signer_ctx.get(), nullptr, &siglength, digest.data(), digestlength)
-		<= 0) {
+	size_t digestlength = MENDER_DIGEST_SHA256_LENGTH;
+	size_t siglength = EVP_PKEY_size(EVP_PKEY_CTX_get0_pkey(pkey_signer_ctx.get()));
+	if (siglength <= 0) {
 		return expected::unexpected(MakeError(
 			SetupError, "Failed to get the signature buffer length: " + GetOpenSSLErrorMessage()));
 	}
