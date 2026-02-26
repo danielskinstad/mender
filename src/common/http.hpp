@@ -122,6 +122,8 @@ enum StatusCode {
 	StatusConflict = 409,
 	StatusTooManyRequests = 429,
 
+	StatusRequestBodyTooLarge = 413,
+
 	StatusInternalServerError = 500,
 	StatusNotImplemented = 501,
 };

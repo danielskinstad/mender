@@ -700,6 +700,12 @@ void SendStatusUpdateState::DoStatusUpdateHandler(
 			// failure, even if retry is enabled.
 			poster.PostEvent(StateEvent::DeploymentAborted);
 			return;
+		} else if (
+			error.http_code.has_value()
+			&& error.http_code.value() == http::StatusRequestBodyTooLarge) {
+			// There is no need to retry if the request body is too large
+			poster.PostEvent(StateEvent::Failure);
+			return;
 		}
 
 		switch (mode_) {
