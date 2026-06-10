@@ -11,3 +11,14 @@ target_compile_options(mender_update_state_test PRIVATE ${PLATFORM_SPECIFIC_COMP
 gtest_discover_tests(mender_update_state_test NO_PRETTY_VALUES)
 add_dependencies(tests mender_update_state_test)
 
+add_executable(update_service_test EXCLUDE_FROM_ALL update_service_test.cpp)
+target_link_libraries(update_service_test PUBLIC
+  common_testing
+  mender_update_daemon
+  main_test
+  gmock
+)
+target_compile_options(update_service_test PRIVATE ${PLATFORM_SPECIFIC_COMPILE_OPTIONS})
+gtest_discover_tests(update_service_test)
+add_dependencies(tests update_service_test)
+

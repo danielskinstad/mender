@@ -75,6 +75,7 @@ add_library(mender_update_daemon STATIC
   daemon/states.cpp
   daemon/state_machine/state_machine.cpp
   daemon/state_machine/platform/posix/signal_handling.cpp
+  daemon/ipc/update_service.cpp
 )
 target_link_libraries(mender_update_daemon PUBLIC
   api_client
@@ -87,6 +88,7 @@ target_link_libraries(mender_update_daemon PUBLIC
   mender_inventory
   artifact_scripts_executor
   common_state_machine
+  common_varlink
 )
 if(MENDER_EMBED_MENDER_AUTH)
   target_link_libraries(mender_update_daemon PUBLIC

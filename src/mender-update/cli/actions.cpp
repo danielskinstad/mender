@@ -31,6 +31,7 @@
 
 #include <mender-update/cli/cli.hpp>
 #include <mender-update/daemon.hpp>
+#include <mender-update/daemon/ipc/update_service.hpp>
 #include <mender-update/standalone.hpp>
 
 #ifdef MENDER_EMBED_MENDER_AUTH
@@ -353,7 +354,22 @@ error::Error DaemonAction::Execute(context::MenderContext &main_context) {
 		log::Info("The update client daemon is now ready to handle incoming deployments");
 	});
 
-	return state_machine.Run();
+	daemon::ipc::UpdateService update_service(event_loop, ctx, state_machine);
+	{
+		const auto sock = main_context.GetConfig().paths.GetUpdateSocketPath();
+		auto serr = update_service.Listen(sock);
+		if (serr != error::NoError) {
+			log::Error(
+				"Could not start update IPC service on " + sock + ": " + serr.String());
+			// Non-fatal: the daemon still performs updates without the IPC service.
+		} else {
+			log::Info("Update IPC service listening on " + sock);
+		}
+	}
+
+	auto run_err = state_machine.Run();
+	update_service.Stop();
+	return run_err;
 }
 
 static expected::ExpectedString GetPID() {

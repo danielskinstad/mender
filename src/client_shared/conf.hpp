@@ -172,6 +172,8 @@ private:
 
 	string key_file = path::Join(data_store, "mender-agent.pem");
 
+	string update_socket = conf::GetEnv("MENDER_UPDATE_SOCKET", "/run/mender/update.sock");
+
 public:
 	string GetPathConfDir() const {
 		return path_conf_dir;
@@ -282,6 +284,13 @@ public:
 	}
 	void SetBootstrapArtifactFile(const string &bootstrap_artifact_file) {
 		this->bootstrap_artifact_file = bootstrap_artifact_file;
+	}
+
+	string GetUpdateSocketPath() const {
+		return update_socket;
+	}
+	void SetUpdateSocketPath(const string &p) {
+		this->update_socket = p;
 	}
 };
 
