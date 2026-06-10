@@ -1,0 +1,3 @@
+add_library(common_varlink STATIC server.cpp)
+target_compile_options(common_varlink PRIVATE ${PLATFORM_SPECIFIC_COMPILE_OPTIONS})
+target_link_libraries(common_varlink PUBLIC common_error common_events common_json common_log)

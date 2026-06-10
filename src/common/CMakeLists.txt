@@ -245,3 +245,5 @@ add_library(mender_http_resumer STATIC
 target_link_libraries(mender_http_resumer PUBLIC
   common_http
 )
+
+add_subdirectory(varlink)

@@ -129,6 +129,8 @@ endif()
 
 add_subdirectory(http_resumer)
 
+add_subdirectory(varlink)
+
 add_executable(path_test EXCLUDE_FROM_ALL path_test.cpp)
 target_compile_options(path_test PRIVATE ${PLATFORM_SPECIFIC_COMPILE_OPTIONS})
 target_link_libraries(path_test PUBLIC common_path main_test)
