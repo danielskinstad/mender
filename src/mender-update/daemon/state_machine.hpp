@@ -35,6 +35,23 @@ namespace sm = mender::common::state_machine;
 
 namespace context = mender::update::context;
 
+// Error category for IPC control of paused deployments. Lets the varlink layer
+// map control failures (e.g. NotPausedError -> io.mender.Update1.NotPaused).
+enum ControlErrorCode {
+	NoError = 0,
+	NotPausedError,
+	InvalidArgumentError,
+};
+
+class ControlErrorCategoryClass : public std::error_category {
+public:
+	const char *name() const noexcept override;
+	string message(int code) const override;
+};
+extern const ControlErrorCategoryClass ControlErrorCategory;
+
+error::Error MakeError(ControlErrorCode code, const string &msg);
+
 class StateMachine {
 public:
 	StateMachine(Context &ctx, events::EventLoop &event_loop);
@@ -51,6 +68,14 @@ public:
 #ifndef NDEBUG
 	void StopAfterDeployments(int number);
 #endif
+
+	DeploymentStatusSnapshot QueryDeploymentState() const;
+
+	// IPC control of a paused deployment. Each returns NotPausedError if no
+	// deployment is currently paused. Safe to call from the daemon event loop.
+	error::Error ResumePausedDeployment();
+	error::Error AbortPausedDeployment();
+	error::Error ExtendPauseTimeout(int64_t seconds);
 
 private:
 	Context &ctx_;
@@ -77,6 +102,12 @@ private:
 	UpdateDownloadCancelState update_download_cancel_state_;
 	SendStatusUpdateState send_install_status_state_;
 	UpdateInstallState update_install_state_;
+
+	// PauseBefore checkpoints — inserted before each major phase boundary.
+	PauseState pause_before_download_;
+	PauseState pause_before_install_;
+	PauseState pause_before_reboot_;
+	PauseState pause_before_commit_;
 
 	// Currently used same state code for checking NeedsReboot both before normal reboot, and
 	// before rollback reboot, since currently they have the same behavior, only different state

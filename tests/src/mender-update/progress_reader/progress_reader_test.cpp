@@ -65,3 +65,51 @@ TEST(ProgressReaderTests, RegularRead) {
 
 	EXPECT_EQ(output, "\r0%\r5%\r25%\r90%\r100%");
 }
+
+TEST(ProgressReaderTests, ProgressCallback) {
+	// Buffer of known size so percentages are deterministic.
+	const int64_t size = 1000;
+	std::vector<uint8_t> data(static_cast<size_t>(size), 'x');
+	std::string d {data.begin(), data.end()};
+
+	std::shared_ptr<io::StringReader> rdr = std::make_shared<io::StringReader>(d);
+
+	std::vector<int> progress;
+	auto reader = progress::Reader(
+		rdr, size, [&progress](int percentage) { progress.push_back(percentage); });
+
+	testing::internal::CaptureStderr();
+
+	// Read the whole buffer 10 bytes at a time => one callback per 1% increase.
+	std::vector<uint8_t> tmp(10);
+	for (int i = 0; i < 100; i++) {
+		ASSERT_TRUE(reader.Read(tmp.begin(), tmp.end()));
+	}
+
+	(void) testing::internal::GetCapturedStderr();
+
+	// One callback per distinct percentage increment, strictly increasing,
+	// ending at 100.
+	ASSERT_FALSE(progress.empty());
+	EXPECT_EQ(progress.front(), 1);
+	EXPECT_EQ(progress.back(), 100);
+	EXPECT_EQ(progress.size(), 100u);
+	for (size_t i = 1; i < progress.size(); i++) {
+		EXPECT_GT(progress[i], progress[i - 1]);
+	}
+}
+
+TEST(ProgressReaderTests, NoCallbackBackwardCompatible) {
+	// Two-arg construction must still work and not crash (no callback).
+	const int64_t size = 100;
+	std::vector<uint8_t> data(static_cast<size_t>(size), 'y');
+	std::string d {data.begin(), data.end()};
+
+	std::shared_ptr<io::StringReader> rdr = std::make_shared<io::StringReader>(d);
+	auto reader = progress::Reader(rdr, size);
+
+	testing::internal::CaptureStderr();
+	std::vector<uint8_t> tmp(static_cast<size_t>(size));
+	ASSERT_TRUE(reader.Read(tmp.begin(), tmp.end()));
+	(void) testing::internal::GetCapturedStderr();
+}

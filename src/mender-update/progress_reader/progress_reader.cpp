@@ -31,6 +31,9 @@ expected::ExpectedSize Reader::Read(
 		if (percentage > last_percentage_) {
 			cerr << "\r" << percentage << "%";
 			last_percentage_ = percentage;
+			if (on_progress_) {
+				on_progress_(percentage);
+			}
 		}
 	}
 	return exp_read;

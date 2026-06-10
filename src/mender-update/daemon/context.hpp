@@ -15,7 +15,9 @@
 #ifndef MENDER_UPDATE_DAEMON_CONTEXT_HPP
 #define MENDER_UPDATE_DAEMON_CONTEXT_HPP
 
+#include <functional>
 #include <memory>
+#include <vector>
 
 #include <common/error.hpp>
 #include <common/events.hpp>
@@ -125,6 +127,11 @@ struct UpdateInfo {
 	// affect which deployment status you get at the end of the update, as well as the
 	// "INCONSISTENT" label on artifact_name.
 	bool all_rollbacks_successful {false};
+
+	// Absolute deadline (epoch seconds) after which a paused deployment is
+	// auto-aborted. 0 = not paused / no deadline set. Added for PauseBefore; read
+	// optionally so the schema version is unchanged.
+	int64_t pause_deadline {0};
 };
 
 struct StateData {
@@ -141,6 +148,15 @@ using ExpectedStateData = expected::expected<StateData, error::Error>;
 
 ExpectedStateData ApiResponseJsonToStateData(const json::Json &json);
 
+struct DeploymentStatusSnapshot {
+	bool active {false};        // a deployment is in progress (state_data != nullptr)
+	bool paused {false};
+	string paused_state;        // boundary if paused; else ""
+	string deployment_id;       // "" if none
+	int64_t pause_deadline {0}; // epoch seconds; 0 if not paused
+	int download_progress {-1}; // download percentage [0, 100]; -1 = N/A
+};
+
 class Context {
 public:
 	Context(mender::update::context::MenderContext &mender_context, events::EventLoop &event_loop);
@@ -153,6 +169,24 @@ public:
 	// loading the data. Note that if the returned error is StateDataStoreCountExceededError,
 	// then the state_data is still filled in and valid.
 	expected::ExpectedBool LoadDeploymentStateData(StateData &state_data);
+
+	// Observer API: callers register a function that is called whenever the
+	// deployment status changes (pause, resume, abort, end-of-deployment). The
+	// observer returns false to request its own removal (e.g. a streaming IPC
+	// subscriber whose client has disconnected).
+	using StatusObserver = std::function<bool(const DeploymentStatusSnapshot &)>;
+	void AddStatusObserver(StatusObserver observer);
+	DeploymentStatusSnapshot BuildStatusSnapshot() const;
+	void NotifyStatusChanged();
+	// Called from the download progress callback (wired in UpdateDownloadState)
+	// once per integer percentage increase. De-duplicates and notifies observers
+	// so Monitor subscribers get a live download-progress feed without polling.
+	void ReportDownloadProgress(int percentage);
+	// Number of currently registered status observers. Intended for tests that
+	// verify dead observers are pruned.
+	size_t StatusObserverCount() const {
+		return status_observers_.size();
+	}
 
 	void BeginDeploymentLogging();
 	void FinishDeploymentLogging();
@@ -177,6 +211,10 @@ public:
 	events::Timer deployment_timer;
 	events::Timer inventory_timer;
 
+	// Used by PauseState: timeout timer and the while-paused inventory loop.
+	events::Timer pause_timer;
+	events::Timer pause_inventory_timer;
+
 	struct {
 		unique_ptr<StateData> state_data;
 		io::ReaderPtr artifact_reader;
@@ -190,6 +228,12 @@ public:
 
 		bool download_with_sizes {false};
 
+		// PauseBefore: true while the deployment is held in a PauseState.
+		bool paused {false};
+		// Which boundary we paused before ("Download", "ArtifactInstall",
+		// "ArtifactReboot", "ArtifactCommit"). Empty when not paused.
+		string paused_state;
+
 		unique_ptr<deployments::DeploymentLog> logger;
 	} deployment;
 
@@ -200,6 +244,11 @@ public:
 	static const string kUpdateStateArtifactVerifyReboot;
 	static const string kUpdateStateArtifactCommit;
 	static const string kUpdateStateAfterArtifactCommit;
+	// Database values for paused deployments (added for PauseBefore).
+	static const string kUpdateStatePauseBeforeDownload;
+	static const string kUpdateStatePauseBeforeArtifactInstall;
+	static const string kUpdateStatePauseBeforeArtifactReboot;
+	static const string kUpdateStatePauseBeforeArtifactCommit;
 	static const string kUpdateStateArtifactRollback;
 	static const string kUpdateStateArtifactRollbackReboot;
 	static const string kUpdateStateArtifactVerifyRollbackReboot;
@@ -219,6 +268,12 @@ public:
 	static const string kRebootTypeNone;
 	static const string kRebootTypeCustom;
 	static const string kRebootTypeAutomatic;
+
+private:
+	std::vector<StatusObserver> status_observers_;
+	// Last reported download percentage for the current deployment. -1 means
+	// not downloading; reset to -1 when a deployment ends.
+	int last_download_progress_ {-1};
 };
 
 } // namespace daemon

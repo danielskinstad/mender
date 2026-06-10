@@ -490,6 +490,66 @@ artifact_name=test
 )"));
 }
 
+// PauseBefore is a daemon-only feature. Standalone installs use a different state
+// machine that never reads config.pause_before, so they must run to completion
+// even when PauseBefore lists the install boundary.
+TEST(CliTest, PauseBeforeIsIgnoredInStandalone) {
+	mtesting::TemporaryDirectory tmpdir;
+	string artifact = path::Join(tmpdir.Path(), "artifact.mender");
+	ASSERT_TRUE(PrepareSimpleArtifact(tmpdir.Path(), artifact));
+
+	string update_module = path::Join(tmpdir.Path(), "rootfs-image");
+
+	ASSERT_TRUE(PrepareUpdateModule(update_module, R"(#!/bin/bash
+
+TEST_DIR=")" + tmpdir.Path() + R"("
+
+case "$1" in
+    NeedsArtifactReboot|SupportsRollback)
+        :
+        ;;
+    *)
+        echo "$1" >> $TEST_DIR/call.log
+        ;;
+esac
+
+exit 0
+)"));
+
+	// A config that, in the daemon, would pause before ArtifactInstall.
+	string conf_file = path::Join(tmpdir.Path(), "mender.conf");
+	{
+		ofstream f(conf_file);
+		f << R"({ "PauseBefore": ["ArtifactInstall"] })";
+	}
+
+	{
+		vector<string> args {
+			"--config",
+			conf_file,
+			"--datastore",
+			tmpdir.Path(),
+			"install",
+			artifact,
+		};
+
+		mtesting::RedirectStreamOutputs output;
+		int exit_status = cli::Main(
+			args, [&tmpdir](context::MenderContext &ctx) { SetTestDir(tmpdir.Path(), ctx); });
+		EXPECT_EQ(exit_status, 0) << exit_status;
+		EXPECT_EQ(output.GetCerr(), "");
+	}
+
+	// ArtifactInstall + Cleanup present => standalone ran to completion, did NOT pause.
+	EXPECT_TRUE(mtesting::FileContainsExactly(
+		path::Join(tmpdir.Path(), "call.log"), R"(ProvidePayloadFileSizes
+Download
+ArtifactInstall
+ArtifactCommit
+Cleanup
+)"));
+}
+
 TEST(CliTest, InstallAndCommitArtifactCheckProvidesDepends) {
 	/* Install two Artifacts. One to install some provides, and the second one to
 	 verify the depends

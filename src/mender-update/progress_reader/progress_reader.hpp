@@ -12,6 +12,7 @@
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -29,9 +30,16 @@ namespace expected = mender::common::expected;
 
 class Reader : virtual public io::Reader {
 public:
-	Reader(const shared_ptr<io::Reader> &reader, int64_t size) :
+	// `on_progress` (optional) is invoked once per integer percentage increase,
+	// with the new percentage [0, 100]. When null, the reader behaves exactly as
+	// before (only prints to stderr).
+	Reader(
+		const shared_ptr<io::Reader> &reader,
+		int64_t size,
+		std::function<void(int)> on_progress = nullptr) :
 		reader_ {reader},
-		tot_size_ {size} {};
+		tot_size_ {size},
+		on_progress_ {std::move(on_progress)} {};
 
 	expected::ExpectedSize Read(
 		vector<uint8_t>::iterator start, vector<uint8_t>::iterator end) override;
@@ -41,6 +49,7 @@ private:
 	int64_t tot_size_;
 	int64_t bytes_read_ {0};
 	int last_percentage_ {-1};
+	std::function<void(int)> on_progress_;
 };
 
 } // namespace progress

@@ -162,7 +162,9 @@ Context::Context(
 	deployment_client(make_shared<deployments::DeploymentClient>()),
 	inventory_client(make_shared<inventory::InventoryClient>()),
 	deployment_timer(event_loop),
-	inventory_timer(event_loop) {
+	inventory_timer(event_loop),
+	pause_timer(event_loop),
+	pause_inventory_timer(event_loop) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -184,6 +186,12 @@ const string Context::kUpdateStateArtifactVerifyRollbackReboot = "after-rollback
 const string Context::kUpdateStateArtifactFailure = "update-error";
 const string Context::kUpdateStateCleanup = "cleanup";
 const string Context::kUpdateStateStatusReportRetry = "update-retry-report";
+
+// PauseBefore markers. New strings, never used by the legacy Go client.
+const string Context::kUpdateStatePauseBeforeDownload = "pause-before-download";
+const string Context::kUpdateStatePauseBeforeArtifactInstall = "pause-before-install";
+const string Context::kUpdateStatePauseBeforeArtifactReboot = "pause-before-reboot";
+const string Context::kUpdateStatePauseBeforeArtifactCommit = "pause-before-commit";
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Not in use by current client, but were in use by Golang client, and still important to handle
@@ -311,7 +319,8 @@ static string GenerateStateDataJson(const StateData &state_data) {
 			content << R"("HasDBSchemaUpdate":)"
 					<< string(update_info.has_db_schema_update ? "true," : "false,");
 			content << R"("AllRollbacksSuccessful":)"
-					<< string(update_info.all_rollbacks_successful ? "true" : "false");
+					<< string(update_info.all_rollbacks_successful ? "true" : "false") << ",";
+			content << R"("PauseDeadline":)" << to_string(update_info.pause_deadline);
 		}
 		content << "}";
 	}
@@ -525,6 +534,10 @@ static error::Error UnmarshalJsonStateData(const json::Json &json, StateData &st
 	exp_bool = json_update_info.Get("AllRollbacksSuccessful").and_then(json::ToBool);
 	DefaultOrSetOrReturnIfError(update_info.all_rollbacks_successful, exp_bool, false);
 
+	// Optional; absent in pre-PauseBefore state data (defaults to 0, no schema bump).
+	exp_int64 = json_update_info.Get("PauseDeadline").and_then(json::ToInt64);
+	DefaultOrSetOrReturnIfError(update_info.pause_deadline, exp_int64, int64_t(0));
+
 	return error::NoError;
 }
 
@@ -662,6 +675,42 @@ expected::ExpectedBool Context::LoadDeploymentStateData(StateData &state_data) {
 	} else {
 		return expected::unexpected(err);
 	}
+}
+
+void Context::AddStatusObserver(StatusObserver observer) {
+	status_observers_.push_back(std::move(observer));
+}
+
+DeploymentStatusSnapshot Context::BuildStatusSnapshot() const {
+	DeploymentStatusSnapshot s;
+	s.active = deployment.state_data != nullptr;
+	s.paused = deployment.paused;
+	s.paused_state = deployment.paused_state;
+	s.download_progress = last_download_progress_;
+	if (deployment.state_data != nullptr) {
+		s.deployment_id = deployment.state_data->update_info.id;
+		s.pause_deadline = deployment.state_data->update_info.pause_deadline;
+	}
+	return s;
+}
+
+void Context::NotifyStatusChanged() {
+	const auto snapshot = BuildStatusSnapshot();
+	for (auto it = status_observers_.begin(); it != status_observers_.end();) {
+		if ((*it)(snapshot)) {
+			++it;
+		} else {
+			it = status_observers_.erase(it);
+		}
+	}
+}
+
+void Context::ReportDownloadProgress(int percentage) {
+	if (percentage == last_download_progress_) {
+		return;
+	}
+	last_download_progress_ = percentage;
+	NotifyStatusChanged();
 }
 
 void Context::BeginDeploymentLogging() {

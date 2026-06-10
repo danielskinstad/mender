@@ -190,7 +190,8 @@ void UpdateModule::StreamNextOpenHandler(io::ExpectedAsyncWriterPtr writer) {
 	}
 	auto payload_reader = make_shared<artifact::Reader>(std::move(reader.value()));
 
-	auto progress_reader = make_shared<progress::Reader>(payload_reader, payload_reader->Size());
+	auto progress_reader = make_shared<progress::Reader>(
+		payload_reader, payload_reader->Size(), download_progress_callback_);
 
 	download_->current_payload_reader_ =
 		make_shared<events::io::AsyncReaderFromReader>(download_->event_loop_, progress_reader);

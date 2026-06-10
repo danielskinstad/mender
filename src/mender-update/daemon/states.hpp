@@ -108,6 +108,23 @@ private:
 	http::ExponentialBackoff backoff_;
 };
 
+// Holds a deployment before a given boundary when that boundary is listed in
+// config.pause_before. Inserted before Download / ArtifactInstall /
+// ArtifactReboot / ArtifactCommit. Posts no event while paused (holds); aborts
+// via StateEvent::Failure on timeout.
+class PauseState : virtual public StateType {
+public:
+	PauseState(const string &boundary_name, const string &db_state_string);
+
+	void OnEnter(Context &ctx, sm::EventPoster<StateEvent> &poster) override;
+
+private:
+	void SubmitInventoryWhilePaused(Context &ctx);
+
+	const string boundary_name_;
+	const string db_state_string_;
+};
+
 class SaveState : virtual public StateType {
 public:
 	// Sub states should implement OnEnterSaveState instead, since we do state saving in

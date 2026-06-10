@@ -14,6 +14,9 @@
 
 #include <mender-update/daemon/state_machine.hpp>
 
+#include <chrono>
+#include <string>
+
 #include <client_shared/conf.hpp>
 #include <common/key_value_database.hpp>
 #include <common/log.hpp>
@@ -27,6 +30,29 @@ namespace daemon {
 namespace conf = mender::client_shared::conf;
 namespace kvdb = mender::common::key_value_database;
 namespace log = mender::common::log;
+
+const ControlErrorCategoryClass ControlErrorCategory;
+
+const char *ControlErrorCategoryClass::name() const noexcept {
+	return "ControlErrorCategory";
+}
+
+string ControlErrorCategoryClass::message(int code) const {
+	switch (code) {
+	case NoError:
+		return "Success";
+	case NotPausedError:
+		return "No deployment is currently paused";
+	case InvalidArgumentError:
+		return "Invalid argument";
+	}
+	assert(false);
+	return "Unknown";
+}
+
+error::Error MakeError(ControlErrorCode code, const string &msg) {
+	return error::Error(error_condition(code, ControlErrorCategory), msg);
+}
 
 StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 	ctx_(ctx),
@@ -52,6 +78,10 @@ StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 		ctx.mender_context.GetConfig().retry_poll_count),
 	send_download_status_state_(deployments::DeploymentStatus::Downloading),
 	send_install_status_state_(deployments::DeploymentStatus::Installing),
+	pause_before_download_("Download", Context::kUpdateStatePauseBeforeDownload),
+	pause_before_install_("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall),
+	pause_before_reboot_("ArtifactReboot", Context::kUpdateStatePauseBeforeArtifactReboot),
+	pause_before_commit_("ArtifactCommit", Context::kUpdateStatePauseBeforeArtifactCommit),
 	send_reboot_status_state_(deployments::DeploymentStatus::Rebooting),
 	send_commit_status_state_(
 		deployments::DeploymentStatus::Installing,
@@ -141,7 +171,10 @@ StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 	main_states_.AddTransition(send_download_status_state_,             se::Success,                     ss.download_enter_,                      tf::Immediate);
 	main_states_.AddTransition(send_download_status_state_,             se::DeploymentAborted,           update_cleanup_state_,                   tf::Immediate);
 
-	main_states_.AddTransition(ss.download_enter_,                      se::Success,                     update_download_state_,                  tf::Immediate);
+	main_states_.AddTransition(ss.download_enter_,                      se::Success,                     pause_before_download_,                  tf::Immediate);
+	main_states_.AddTransition(pause_before_download_,                  se::Success,                     update_download_state_,                  tf::Immediate);
+	main_states_.AddTransition(pause_before_download_,                  se::Failure,                     ss.download_error_,                      tf::Immediate);
+	main_states_.AddTransition(pause_before_download_,                  se::StateLoopDetected,           state_loop_state_,                       tf::Immediate);
 	main_states_.AddTransition(ss.download_enter_,                      se::Failure,                     ss.download_error_,                      tf::Immediate);
 	main_states_.AddTransition(ss.download_enter_,                      se::StateLoopDetected,           state_loop_state_,                       tf::Immediate);
 	main_states_.AddTransition(ss.download_error_,                      se::Success,                     update_rollback_not_needed_state_,       tf::Immediate);
@@ -161,7 +194,10 @@ StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 	main_states_.AddTransition(ss.download_leave_save_provides,         se::Success,                     update_save_provides_state_,             tf::Immediate);
 	main_states_.AddTransition(ss.download_leave_save_provides,         se::Failure,                     ss.download_error_,                      tf::Immediate);
 
-	main_states_.AddTransition(ss.install_enter_,                       se::Success,                     update_install_state_,                   tf::Immediate);
+	main_states_.AddTransition(ss.install_enter_,                       se::Success,                     pause_before_install_,                   tf::Immediate);
+	main_states_.AddTransition(pause_before_install_,                   se::Success,                     update_install_state_,                   tf::Immediate);
+	main_states_.AddTransition(pause_before_install_,                   se::Failure,                     ss.install_error_rollback_,              tf::Immediate);
+	main_states_.AddTransition(pause_before_install_,                   se::StateLoopDetected,           state_loop_state_,                       tf::Immediate);
 	main_states_.AddTransition(ss.install_enter_,                       se::Failure,                     ss.install_error_rollback_,              tf::Immediate);
 
 	// Fail the deployment if it's aborted. All other failures will be ignored due to FailureMode::Ignore
@@ -191,7 +227,10 @@ StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 	main_states_.AddTransition(send_reboot_status_state_,               se::Success,                     ss.reboot_enter_,                        tf::Immediate);
 	main_states_.AddTransition(send_reboot_status_state_,               se::DeploymentAborted,           update_check_rollback_state_,            tf::Immediate);
 
-	main_states_.AddTransition(ss.reboot_enter_,                        se::Success,                     update_reboot_state_,                    tf::Immediate);
+	main_states_.AddTransition(ss.reboot_enter_,                        se::Success,                     pause_before_reboot_,                    tf::Immediate);
+	main_states_.AddTransition(pause_before_reboot_,                    se::Success,                     update_reboot_state_,                    tf::Immediate);
+	main_states_.AddTransition(pause_before_reboot_,                    se::Failure,                     ss.reboot_error_,                        tf::Immediate);
+	main_states_.AddTransition(pause_before_reboot_,                    se::StateLoopDetected,           state_loop_state_,                       tf::Immediate);
 	main_states_.AddTransition(ss.reboot_enter_,                        se::Failure,                     ss.reboot_error_,                        tf::Immediate);
 
 	main_states_.AddTransition(update_reboot_state_,                    se::Success,                     update_verify_reboot_state_,             tf::Immediate);
@@ -216,7 +255,10 @@ StateMachine::StateMachine(Context &ctx, events::EventLoop &event_loop) :
 	main_states_.AddTransition(send_commit_status_state_,               se::Failure,                     update_check_rollback_state_,            tf::Immediate);
 	main_states_.AddTransition(send_commit_status_state_,               se::DeploymentAborted,           update_check_rollback_state_,            tf::Immediate);
 
-	main_states_.AddTransition(ss.commit_enter_,                        se::Success,                     update_commit_state_,                    tf::Immediate);
+	main_states_.AddTransition(ss.commit_enter_,                        se::Success,                     pause_before_commit_,                    tf::Immediate);
+	main_states_.AddTransition(pause_before_commit_,                    se::Success,                     update_commit_state_,                    tf::Immediate);
+	main_states_.AddTransition(pause_before_commit_,                    se::Failure,                     ss.commit_error_,                        tf::Immediate);
+	main_states_.AddTransition(pause_before_commit_,                    se::StateLoopDetected,           state_loop_state_,                       tf::Immediate);
 	main_states_.AddTransition(ss.commit_enter_,                        se::Failure,                     ss.commit_error_,                        tf::Immediate);
 
 	main_states_.AddTransition(ss.commit_error_,                        se::Success,                     update_check_rollback_state_,            tf::Immediate);
@@ -451,6 +493,24 @@ void StateMachine::LoadStateFromDb() {
 			deployment_tracking_.states_.SetState(deployment_tracking_.failure_state_);
 		}
 
+	} else if (state == ctx_.kUpdateStatePauseBeforeDownload) {
+		// Re-enter the pause where we left off, so a daemon restart while paused
+		// does not look like a power loss (which would roll back).
+		main_states_.SetState(pause_before_download_);
+		deployment_tracking_.states_.SetState(deployment_tracking_.no_failures_state_);
+
+	} else if (state == ctx_.kUpdateStatePauseBeforeArtifactInstall) {
+		main_states_.SetState(pause_before_install_);
+		deployment_tracking_.states_.SetState(deployment_tracking_.no_failures_state_);
+
+	} else if (state == ctx_.kUpdateStatePauseBeforeArtifactReboot) {
+		main_states_.SetState(pause_before_reboot_);
+		deployment_tracking_.states_.SetState(deployment_tracking_.no_failures_state_);
+
+	} else if (state == ctx_.kUpdateStatePauseBeforeArtifactCommit) {
+		main_states_.SetState(pause_before_commit_);
+		deployment_tracking_.states_.SetState(deployment_tracking_.no_failures_state_);
+
 	} else {
 		// All other states trigger a rollback.
 		main_states_.SetState(update_check_rollback_state_);
@@ -510,6 +570,70 @@ void StateMachine::StopAfterDeployments(int number) {
 		sm::TransitionFlag::Immediate);
 }
 #endif
+
+DeploymentStatusSnapshot StateMachine::QueryDeploymentState() const {
+	return ctx_.BuildStatusSnapshot();
+}
+
+error::Error StateMachine::ResumePausedDeployment() {
+	if (!ctx_.deployment.paused) {
+		return MakeError(NotPausedError, "No paused deployment to continue");
+	}
+	log::Info("Resuming paused deployment via IPC");
+	ctx_.pause_timer.Cancel();
+	ctx_.pause_inventory_timer.Cancel();
+	ctx_.deployment.paused = false;
+	ctx_.deployment.paused_state.clear();
+	ctx_.NotifyStatusChanged();
+	runner_.PostEvent(StateEvent::Success);
+	return error::NoError;
+}
+
+error::Error StateMachine::AbortPausedDeployment() {
+	if (!ctx_.deployment.paused) {
+		return MakeError(NotPausedError, "No paused deployment to abort");
+	}
+	log::Info("Aborting paused deployment via IPC");
+	ctx_.pause_timer.Cancel();
+	ctx_.pause_inventory_timer.Cancel();
+	ctx_.deployment.paused = false;
+	ctx_.deployment.paused_state.clear();
+	ctx_.NotifyStatusChanged();
+	runner_.PostEvent(StateEvent::Failure);
+	return error::NoError;
+}
+
+error::Error StateMachine::ExtendPauseTimeout(int64_t seconds) {
+	if (!ctx_.deployment.paused) {
+		return MakeError(NotPausedError, "No paused deployment");
+	}
+	if (seconds <= 0) {
+		return MakeError(InvalidArgumentError, "seconds must be positive");
+	}
+	log::Info("Extending pause timeout by " + std::to_string(seconds) + "s via IPC");
+	const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+							std::chrono::system_clock::now().time_since_epoch())
+							.count();
+	auto &ui = ctx_.deployment.state_data->update_info;
+	ui.pause_deadline = now + seconds;
+	auto err = ctx_.SaveDeploymentStateData(*ctx_.deployment.state_data);
+	if (err != error::NoError) {
+		return err;
+	}
+	ctx_.pause_timer.Cancel();
+	ctx_.pause_timer.AsyncWait(std::chrono::seconds(seconds), [this](error::Error e) {
+		if (e != error::NoError) {
+			return; // cancelled
+		}
+		log::Warning("Pause timed out (after IPC extension); aborting deployment");
+		ctx_.pause_inventory_timer.Cancel();
+		ctx_.deployment.paused = false;
+		ctx_.deployment.paused_state.clear();
+		ctx_.NotifyStatusChanged();
+		runner_.PostEvent(StateEvent::Failure);
+	});
+	return error::NoError;
+}
 
 } // namespace daemon
 } // namespace update

@@ -14,6 +14,9 @@
 
 #include <mender-update/daemon/states.hpp>
 
+#include <algorithm>
+#include <chrono>
+
 #include <client_shared/conf.hpp>
 #include <common/events_io.hpp>
 #include <common/log.hpp>
@@ -362,6 +365,116 @@ void PollForDeploymentState::OnEnter(Context &ctx, sm::EventPoster<StateEvent> &
 	}
 }
 
+PauseState::PauseState(const string &boundary_name, const string &db_state_string) :
+	boundary_name_ {boundary_name},
+	db_state_string_ {db_state_string} {
+}
+
+void PauseState::OnEnter(Context &ctx, sm::EventPoster<StateEvent> &poster) {
+	const auto &pause_before = ctx.mender_context.GetConfig().pause_before;
+	if (find(pause_before.begin(), pause_before.end(), boundary_name_) == pause_before.end()) {
+		// Not configured to pause at this boundary; continue immediately.
+		poster.PostEvent(StateEvent::Success);
+		return;
+	}
+
+	log::Info("Pausing deployment before " + boundary_name_);
+
+	ctx.deployment.paused = true;
+	ctx.deployment.paused_state = boundary_name_;
+
+	assert(ctx.deployment.state_data);
+	auto &update_info = ctx.deployment.state_data->update_info;
+
+	// Set the absolute deadline once, on the first pause. On a restart it is
+	// already set, so we honor the remaining time instead of restarting the clock.
+	const int64_t now = chrono::duration_cast<chrono::seconds>(
+							chrono::system_clock::now().time_since_epoch())
+							.count();
+	if (update_info.pause_deadline == 0) {
+		update_info.pause_deadline =
+			now + ctx.mender_context.GetConfig().pause_before_timeout_seconds;
+	}
+
+	// Persist the pause marker (and the deadline) so a restart re-enters the pause
+	// rather than treating it as a power loss and rolling back.
+	ctx.deployment.state_data->state = db_state_string_;
+	log::Trace("Storing pause marker in DB: " + db_state_string_);
+	auto err = ctx.SaveDeploymentStateData(*ctx.deployment.state_data);
+	if (err != error::NoError) {
+		log::Error(err.String());
+		if (err.code
+			== main_context::MakeError(main_context::StateDataStoreCountExceededError, "").code) {
+			poster.PostEvent(StateEvent::StateLoopDetected);
+		} else {
+			poster.PostEvent(StateEvent::Failure);
+		}
+		return;
+	}
+
+	// Notify observers that the deployment is now paused.
+	ctx.NotifyStatusChanged();
+
+	const int64_t remaining = update_info.pause_deadline - now;
+	if (remaining <= 0) {
+		log::Warning(
+			"Pause before " + boundary_name_ + " already past its deadline; aborting deployment");
+		poster.PostEvent(StateEvent::Failure);
+		return;
+	}
+
+	ctx.pause_timer.AsyncWait(
+		chrono::seconds(remaining), [this, &ctx, &poster](error::Error timer_err) {
+			if (timer_err != error::NoError) {
+				return; // Cancelled.
+			}
+			log::Warning("Pause before " + boundary_name_ + " timed out; aborting deployment");
+			ctx.pause_inventory_timer.Cancel();
+			// Clear the pause flags before leaving the pause, so IPC GetState/Monitor
+			// no longer report it paused and Continue/Abort/ExtendTimeout are rejected
+			// (the SM is no longer in this PauseState).
+			ctx.deployment.paused = false;
+			ctx.deployment.paused_state.clear();
+			ctx.NotifyStatusChanged();
+			poster.PostEvent(StateEvent::Failure);
+		});
+
+	// Keep submitting inventory while paused (a later task fleshes this loop out).
+	SubmitInventoryWhilePaused(ctx);
+
+	// Post no progress event: the deployment holds here.
+}
+
+void PauseState::SubmitInventoryWhilePaused(Context &ctx) {
+	// While paused the main state machine is not idle, so its idle-gated inventory
+	// scheduling never fires. Run our own best-effort inventory loop here instead.
+	// Deployment polling stays suppressed because we never return to idle.
+	log::Debug("Submitting inventory while paused");
+
+	auto err = ctx.inventory_client->PushData(
+		ctx.mender_context.GetConfig().paths.GetInventoryScriptsDir(),
+		ctx.event_loop,
+		ctx.http_client,
+		[](inventory::APIResponse resp) {
+			if (resp.error != error::NoError) {
+				log::Warning("Inventory submission while paused failed: " + resp.error.String());
+			}
+		});
+	if (err != error::NoError) {
+		log::Warning("Could not submit inventory while paused: " + err.String());
+	}
+
+	// Re-arm for the next interval. The timer is cancelled when the pause ends.
+	const int interval = ctx.mender_context.GetConfig().inventory_poll_interval_seconds;
+	ctx.pause_inventory_timer.AsyncWait(
+		chrono::seconds(interval), [this, &ctx](error::Error timer_err) {
+			if (timer_err != error::NoError) {
+				return; // Cancelled (pause ended).
+			}
+			SubmitInventoryWhilePaused(ctx);
+		});
+}
+
 void SaveState::OnEnter(Context &ctx, sm::EventPoster<StateEvent> &poster) {
 	assert(ctx.deployment.state_data);
 
@@ -583,6 +696,15 @@ void UpdateDownloadState::DoDownload(Context &ctx, sm::EventPoster<StateEvent> &
 
 		poster.PostEvent(StateEvent::Success);
 	};
+
+	// Stream live download progress to status observers (e.g. varlink Monitor).
+	// Lifetime: the update_module lives inside ctx.deployment, so it cannot
+	// outlive ctx. The callback runs inline on the download read path, which is
+	// driven by the same single-threaded event loop as ctx, so capturing &ctx is
+	// safe. The callback is cleared together with the update_module when the
+	// deployment ends (ctx.deployment = {}).
+	ctx.deployment.update_module->SetDownloadProgressCallback(
+		[&ctx](int percentage) { ctx.ReportDownloadProgress(percentage); });
 
 	if (ctx.deployment.download_with_sizes) {
 		ctx.deployment.update_module->AsyncDownloadWithFileSizes(
@@ -1123,7 +1245,13 @@ void EndOfDeploymentState::OnEnter(Context &ctx, sm::EventPoster<StateEvent> &po
 
 	ctx.FinishDeploymentLogging();
 
+	// Clear the deployment context first, then notify: observers will see
+	// active=false / paused=false, i.e. the "idle" snapshot, which signals
+	// that the deployment has ended. Reset download progress so the next
+	// deployment starts fresh (and the idle snapshot reports -1).
 	ctx.deployment = {};
+	ctx.ReportDownloadProgress(-1);
+	ctx.NotifyStatusChanged();
 	poster.PostEvent(
 		StateEvent::InventoryPollingTriggered); // Submit the inventory right after an update
 	poster.PostEvent(StateEvent::DeploymentEnded);

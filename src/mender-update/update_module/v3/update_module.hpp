@@ -154,6 +154,14 @@ public:
 
 	void SetSystemRebootRunner(unique_ptr<SystemRebootRunner> &&system_reboot_runner);
 
+	// Optional callback invoked once per integer percentage increase while
+	// downloading the artifact payload. Must be cheap and non-blocking; it runs
+	// inline on the download read path (same thread as the event loop). When
+	// unset, download behaves as before.
+	void SetDownloadProgressCallback(function<void(int)> cb) {
+		download_progress_callback_ = std::move(cb);
+	}
+
 private:
 	UpdateModule(MenderContext &ctx, const string &payload_type, string update_module_path);
 	error::Error AsyncCallStateCapture(
@@ -195,6 +203,10 @@ private:
 	context::MenderContext &ctx_;
 	string update_module_path_;
 	string update_module_workdir_;
+
+	// See SetDownloadProgressCallback. Passed to the progress::Reader at download
+	// start; null by default.
+	function<void(int)> download_progress_callback_;
 
 	struct DownloadData {
 		DownloadData(events::EventLoop &event_loop, artifact::Payload &payload);

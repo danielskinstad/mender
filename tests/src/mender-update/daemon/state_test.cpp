@@ -111,6 +111,15 @@ struct StateTransitionsTestCase {
 	// Set it to the string that the database should contain.
 	string update_control_string;
 	int stop_after_n_deployments {1};
+
+	// PauseBefore: states to pause before (empty = feature off).
+	vector<string> pause_before;
+	// 0 = leave the config default; >0 = override PauseBeforeTimeoutSeconds.
+	int pause_before_timeout_seconds {0};
+	// If non-empty, SIGKILL the subprocess once (across the restart loop) as soon
+	// as the persisted state data contains this substring. Used to simulate a
+	// daemon restart while the deployment is paused.
+	string kill_when_db_contains;
 };
 
 
@@ -3191,6 +3200,77 @@ vector<StateTransitionsTestCase> GenerateStateTransitionsTestCases() {
 			.spont_reboot_states = {"ArtifactReboot"},
 			.update_control_string = R"({"something_update_control_related":true})",
 		},
+
+		StateTransitionsTestCase {
+			.case_name = "PauseBeforeInstall_survives_restart_then_times_out",
+			.state_chain =
+				{
+					"Download_Enter_00",
+					"ProvidePayloadFileSizes",
+					"Download",
+					"Download_Leave_00",
+					"ArtifactInstall_Enter_00",
+					// Paused here; the watchdog SIGKILLs us (restart). On restart we
+					// re-enter the pause (no Enter scripts re-run), then the short
+					// timeout fires and we abort + roll back.
+					"ArtifactInstall_Error_00",
+					"ArtifactRollback_Enter_00",
+					"ArtifactRollback",
+					"ArtifactRollback_Leave_00",
+					"ArtifactRollbackReboot_Enter_00",
+					"ArtifactRollbackReboot",
+					"ArtifactVerifyRollbackReboot",
+					"ArtifactRollbackReboot_Leave_00",
+					"ArtifactFailure_Enter_00",
+					"ArtifactFailure",
+					"ArtifactFailure_Leave_00",
+					"Cleanup",
+				},
+			.status_log =
+				{
+					"downloading",
+					"installing",
+					"failure",
+				},
+			.install_outcome = InstallOutcome::SuccessfulRollback,
+			.pause_before = {"ArtifactInstall"},
+			.pause_before_timeout_seconds = 2,
+			.kill_when_db_contains = "pause-before-install",
+		},
+
+		StateTransitionsTestCase {
+			.case_name = "PauseBeforeInstall_times_out_and_aborts",
+			.state_chain =
+				{
+					"Download_Enter_00",
+					"ProvidePayloadFileSizes",
+					"Download",
+					"Download_Leave_00",
+					"ArtifactInstall_Enter_00",
+					// Paused here; no restart. The short timeout fires and aborts.
+					"ArtifactInstall_Error_00",
+					"ArtifactRollback_Enter_00",
+					"ArtifactRollback",
+					"ArtifactRollback_Leave_00",
+					"ArtifactRollbackReboot_Enter_00",
+					"ArtifactRollbackReboot",
+					"ArtifactVerifyRollbackReboot",
+					"ArtifactRollbackReboot_Leave_00",
+					"ArtifactFailure_Enter_00",
+					"ArtifactFailure",
+					"ArtifactFailure_Leave_00",
+					"Cleanup",
+				},
+			.status_log =
+				{
+					"downloading",
+					"installing",
+					"failure",
+				},
+			.install_outcome = InstallOutcome::SuccessfulRollback,
+			.pause_before = {"ArtifactInstall"},
+			.pause_before_timeout_seconds = 2,
+		},
 	};
 }
 
@@ -3708,6 +3788,10 @@ void StateTransitionsTestSubProcess(
 		config.paths.SetArtScriptsPath(path::Join(tmpdir, "artifact-scripts"));
 		config.paths.SetRootfsScriptsPath(path::Join(tmpdir, "rootfs-scripts"));
 		config.retry_poll_count = 10;
+		config.pause_before = test.GetParam().pause_before;
+		if (test.GetParam().pause_before_timeout_seconds > 0) {
+			config.pause_before_timeout_seconds = test.GetParam().pause_before_timeout_seconds;
+		}
 
 		string artifact_path;
 		if (test.GetParam().empty_payload_artifact) {
@@ -3753,6 +3837,38 @@ void StateTransitionsTestSubProcess(
 		}
 		StateMachine state_machine(ctx, event_loop, retry_time);
 		state_machine.LoadStateFromDb();
+
+		// Watchdog to simulate a daemon restart while paused: once the persisted
+		// state data contains the requested marker, SIGKILL ourselves (once across
+		// the restart loop, guarded by a sentinel file). The outer test loop then
+		// restarts the subprocess.
+		events::Timer kill_watchdog(event_loop);
+		const string kill_marker = test.GetParam().kill_when_db_contains;
+		const string kill_sentinel = path::Join(tmpdir, "pause-kill.sentinel");
+		function<void()> schedule_kill_check = [&]() {
+			kill_watchdog.AsyncWait(chrono::milliseconds(50), [&](error::Error timer_err) {
+				if (timer_err != error::NoError) {
+					return;
+				}
+				error_code ec;
+				if (!fs::exists(kill_sentinel, ec)) {
+					auto exp_bytes =
+						main_context->GetMenderStoreDB().Read(context::MenderContext::state_data_key);
+					if (exp_bytes) {
+						const string content = common::StringFromByteVector(exp_bytes.value());
+						if (content.find(kill_marker) != string::npos) {
+							ofstream(kill_sentinel).put('x');
+							raise(SIGKILL);
+							return;
+						}
+					}
+				}
+				schedule_kill_check();
+			});
+		};
+		if (!kill_marker.empty()) {
+			schedule_kill_check();
+		}
 
 		ctx.inventory_client = make_shared<NoopInventoryClient>();
 		ctx.deployment_client = make_shared<TestDeploymentClient>(
@@ -4264,6 +4380,53 @@ TEST(StateTest, UpdateControlCleanup) {
 }
 
 
+TEST(PauseDeadlinePersistenceTest, RoundTripsThroughDatabase) {
+	mtesting::TemporaryDirectory tmpdir;
+	conf::MenderConfig config {};
+	config.paths.SetDataStore(tmpdir.Path());
+	context::MenderContext main_context {config};
+	ASSERT_EQ(main_context.Initialize(), error::NoError);
+
+	mtesting::TestEventLoop loop;
+	Context ctx {main_context, loop};
+
+	StateData saved;
+	saved.state = Context::kUpdateStatePauseBeforeArtifactInstall;
+	saved.update_info.id = "deployment-1";
+	saved.update_info.artifact.payload_types = {"test-module"};
+	saved.update_info.pause_deadline = 1893456000; // arbitrary epoch seconds
+	ASSERT_EQ(ctx.SaveDeploymentStateData(saved), error::NoError);
+
+	StateData loaded;
+	auto exp = ctx.LoadDeploymentStateData(loaded);
+	ASSERT_TRUE(exp) << exp.error().String();
+	EXPECT_EQ(loaded.update_info.pause_deadline, 1893456000);
+}
+
+TEST(PauseDeadlinePersistenceTest, DefaultsToZeroWhenAbsent) {
+	// State data written before this field existed must load with deadline 0.
+	mtesting::TemporaryDirectory tmpdir;
+	conf::MenderConfig config {};
+	config.paths.SetDataStore(tmpdir.Path());
+	context::MenderContext main_context {config};
+	ASSERT_EQ(main_context.Initialize(), error::NoError);
+
+	mtesting::TestEventLoop loop;
+	Context ctx {main_context, loop};
+
+	StateData saved;
+	saved.state = Context::kUpdateStateArtifactInstall;
+	saved.update_info.id = "deployment-2";
+	saved.update_info.artifact.payload_types = {"test-module"};
+	// pause_deadline left at its default (0).
+	ASSERT_EQ(ctx.SaveDeploymentStateData(saved), error::NoError);
+
+	StateData loaded;
+	auto exp = ctx.LoadDeploymentStateData(loaded);
+	ASSERT_TRUE(exp) << exp.error().String();
+	EXPECT_EQ(loaded.update_info.pause_deadline, 0);
+}
+
 TEST(DBSchemaMigrationTest, TestFromVersion1To2) {
 	// Setup
 	mtesting::TemporaryDirectory tmpdir;
@@ -4557,6 +4720,186 @@ TEST_F(SendStatusUpdateStateTests, TooManyRequests_NoRetryAfterHeader) {
 		});
 }
 
+class PauseStateTests : public StateTests {
+protected:
+	void SetUpDeployment() {
+		ctx_->deployment.state_data = make_unique<StateData>();
+		ctx_->deployment.state_data->update_info.id = "test-deployment-id";
+	}
+};
+
+TEST_F(PauseStateTests, PassesThroughWhenBoundaryNotConfigured) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactCommit"};
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	EXPECT_CALL(poster_, PostEvent(StateEvent::Success)).Times(1);
+	state.OnEnter(*ctx_, poster_);
+	EXPECT_FALSE(ctx_->deployment.paused);
+}
+
+TEST_F(PauseStateTests, HoldsAndSetsFlagsWhenConfigured) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactInstall"};
+	main_context_->GetConfig().pause_before_timeout_seconds = 100000;
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	// StrictMock: no PostEvent expectation == asserts nothing is posted (holds).
+	state.OnEnter(*ctx_, poster_);
+	EXPECT_TRUE(ctx_->deployment.paused);
+	EXPECT_EQ(ctx_->deployment.paused_state, "ArtifactInstall");
+	EXPECT_EQ(ctx_->deployment.state_data->state, Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	ctx_->pause_timer.Cancel();
+	ctx_->pause_inventory_timer.Cancel();
+}
+
+TEST_F(PauseStateTests, AbortsImmediatelyWhenDeadlineAlreadyPassed) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactInstall"};
+	main_context_->GetConfig().pause_before_timeout_seconds = 604800;
+	// Simulate a deadline already in the past (restart after expiry).
+	ctx_->deployment.state_data->update_info.pause_deadline = 1; // 1970
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	EXPECT_CALL(poster_, PostEvent(StateEvent::Failure)).Times(1);
+	state.OnEnter(*ctx_, poster_);
+
+	ctx_->pause_timer.Cancel();
+	ctx_->pause_inventory_timer.Cancel();
+}
+
+TEST_F(PauseStateTests, SetsDeadlineOnFirstPauseAndKeepsItOnReentry) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactInstall"};
+	main_context_->GetConfig().pause_before_timeout_seconds = 100000;
+	ctx_->deployment.state_data->update_info.pause_deadline = 0;
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	state.OnEnter(*ctx_, poster_); // holds; no event
+	const int64_t first = ctx_->deployment.state_data->update_info.pause_deadline;
+	EXPECT_GT(first, 0);
+
+	// Re-entry (e.g. restart) must not move the deadline.
+	ctx_->deployment.paused = false; // reset transient flag, as a fresh process would
+	state.OnEnter(*ctx_, poster_);
+	EXPECT_EQ(ctx_->deployment.state_data->update_info.pause_deadline, first);
+
+	ctx_->pause_timer.Cancel();
+	ctx_->pause_inventory_timer.Cancel();
+}
+
+TEST_F(PauseStateTests, SubmitsInventoryWhilePaused) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactInstall"};
+	main_context_->GetConfig().pause_before_timeout_seconds = 100000;
+	main_context_->GetConfig().inventory_poll_interval_seconds = 1;
+
+	int n_submissions = 0;
+	class MockInventoryClient : public inventory::InventoryAPI {
+	public:
+		MockInventoryClient(int &recorder, events::EventLoop &loop) :
+			recorder_ {recorder},
+			loop_ {loop} {};
+
+		error::Error PushData(
+			const string &,
+			events::EventLoop &,
+			api::Client &,
+			inventory::APIResponseHandler handler) override {
+			recorder_++;
+			handler(inventory::APIResponse {nullopt, nullopt, error::NoError});
+			if (recorder_ == 2) {
+				loop_.Stop();
+			}
+			return error::NoError;
+		};
+
+		void ClearDataCache() override {
+		}
+
+	private:
+		int &recorder_;
+		events::EventLoop &loop_;
+	} mock {n_submissions, event_loop_};
+
+	ctx_->inventory_client =
+		shared_ptr<inventory::InventoryAPI>(&mock, [](inventory::InventoryAPI *) {});
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+	state.OnEnter(*ctx_, poster_); // holds; arms inventory + timeout timers, submits once
+
+	event_loop_.Run(); // returns when the mock stops it after the 2nd submission
+
+	EXPECT_EQ(n_submissions, 2);
+
+	ctx_->pause_timer.Cancel();
+	ctx_->pause_inventory_timer.Cancel();
+}
+
+TEST(ContextStatusObserverTest, NotifyStatusChangedDeliversSnapshot) {
+	mtesting::TemporaryDirectory tmpdir;
+	conf::MenderConfig config;
+	config.paths.SetDataStore(tmpdir.Path());
+
+	context::MenderContext main_context(config);
+	auto err = main_context.Initialize();
+	ASSERT_EQ(err, error::NoError) << err.String();
+
+	mtesting::TestEventLoop loop;
+	Context ctx(main_context, loop);
+
+	vector<DeploymentStatusSnapshot> received;
+	ctx.AddStatusObserver([&received](const DeploymentStatusSnapshot &s) {
+		received.push_back(s);
+		return true;
+	});
+
+	// Set up a paused deployment in context.
+	ctx.deployment.state_data = make_unique<StateData>();
+	ctx.deployment.state_data->update_info.id = "obs-test-id";
+	ctx.deployment.state_data->update_info.pause_deadline = 999;
+	ctx.deployment.paused = true;
+	ctx.deployment.paused_state = "ArtifactInstall";
+
+	ctx.NotifyStatusChanged();
+
+	ASSERT_EQ(received.size(), 1u);
+	EXPECT_TRUE(received[0].active);
+	EXPECT_TRUE(received[0].paused);
+	EXPECT_EQ(received[0].paused_state, "ArtifactInstall");
+	EXPECT_EQ(received[0].deployment_id, "obs-test-id");
+	EXPECT_EQ(received[0].pause_deadline, 999);
+}
+
+TEST_F(PauseStateTests, OnEnterNotifiesObserverWhenPaused) {
+	SetUpDeployment();
+	main_context_->GetConfig().pause_before = {"ArtifactInstall"};
+	main_context_->GetConfig().pause_before_timeout_seconds = 100000;
+
+	vector<DeploymentStatusSnapshot> received;
+	ctx_->AddStatusObserver([&received](const DeploymentStatusSnapshot &s) {
+		received.push_back(s);
+		return true;
+	});
+
+	PauseState state("ArtifactInstall", Context::kUpdateStatePauseBeforeArtifactInstall);
+
+	// No PostEvent expectation: the state holds (StrictMock).
+	state.OnEnter(*ctx_, poster_);
+
+	ASSERT_EQ(received.size(), 1u);
+	EXPECT_TRUE(received[0].paused);
+	EXPECT_EQ(received[0].paused_state, "ArtifactInstall");
+	EXPECT_EQ(received[0].deployment_id, "test-deployment-id");
+
+	ctx_->pause_timer.Cancel();
+	ctx_->pause_inventory_timer.Cancel();
+}
 
 } // namespace daemon
 } // namespace update
