@@ -311,11 +311,14 @@ error::Error MenderConfig::LoadConfigFile_(const string &path, bool required) {
 			log::Debug("Failed to load config from '" + path + "': " + ret.error().message);
 			return error::NoError;
 		} else {
-			// Incorrect DeviceTier shall lead to the daemon failure
-			auto device_tier_error = config_parser::MakeError(
-				config_parser::ConfigParserErrorCode::DeviceTierError, "Invalid DeviceTier");
-			if (ret.error().code == device_tier_error.code) {
-				log::Error("Failed to get DeviceTier from '" + path + "': " + ret.error().message);
+			// Incorrect DeviceTier or PauseBefore shall lead to the daemon failing to start.
+			const auto device_tier_error = config_parser::MakeError(
+				config_parser::ConfigParserErrorCode::DeviceTierError, "");
+			const auto pause_before_error = config_parser::MakeError(
+				config_parser::ConfigParserErrorCode::PauseBeforeError, "");
+			if (ret.error().code == device_tier_error.code
+				|| ret.error().code == pause_before_error.code) {
+				log::Error("Failed to load config from '" + path + "': " + ret.error().message);
 				return ret.error();
 			}
 			// other errors (parsing errors,...) for default paths should produce warnings

@@ -728,3 +728,123 @@ TEST_F(ConfigParserTests, DeviceTierInvalidConfiguration) {
 	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::DeviceTierError, "").code);
 	EXPECT_THAT(ret.error().String(), testing::HasSubstr("Invalid DeviceTier: foobar"));
 }
+
+TEST_F(ConfigParserTests, PauseBeforeValidConfiguration) {
+	ofstream os(test_config_fname);
+	os << R"({
+  "PauseBefore": ["Download", "ArtifactCommit"]
+})";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_TRUE(ret) << ret.error().String();
+	EXPECT_TRUE(ret.value());
+
+	ASSERT_EQ(mc.pause_before.size(), 2);
+	EXPECT_EQ(mc.pause_before[0], "Download");
+	EXPECT_EQ(mc.pause_before[1], "ArtifactCommit");
+}
+
+TEST_F(ConfigParserTests, PauseBeforeInvalidConfiguration) {
+	ofstream os(test_config_fname);
+	os << R"({
+  "PauseBefore": ["ArtifactInstall", "Bogus"]
+})";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_FALSE(ret);
+	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::PauseBeforeError, "").code);
+	EXPECT_THAT(ret.error().String(), testing::HasSubstr("Bogus"));
+}
+
+TEST_F(ConfigParserTests, PauseBeforeAcceptsBareString) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBefore": "ArtifactInstall" })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_TRUE(ret) << ret.error().String();
+	ASSERT_EQ(mc.pause_before.size(), 1);
+	EXPECT_EQ(mc.pause_before[0], "ArtifactInstall");
+}
+
+TEST_F(ConfigParserTests, PauseBeforeBareStringInvalidRejected) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBefore": "Bogus" })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_FALSE(ret);
+	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::PauseBeforeError, "").code);
+}
+
+TEST_F(ConfigParserTests, PauseBeforeRejectsNonStringNonArray) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBefore": 42 })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_FALSE(ret);
+	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::PauseBeforeError, "").code);
+}
+
+TEST_F(ConfigParserTests, PauseBeforeDefaultIsEmpty) {
+	ofstream os(test_config_fname);
+	os << R"({})";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_TRUE(ret) << ret.error().String();
+	EXPECT_TRUE(mc.pause_before.empty());
+}
+
+TEST_F(ConfigParserTests, PauseBeforeTimeoutSecondsParsed) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBeforeTimeoutSeconds": 3600 })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_TRUE(ret) << ret.error().String();
+	EXPECT_EQ(mc.pause_before_timeout_seconds, 3600);
+}
+
+TEST_F(ConfigParserTests, PauseBeforeTimeoutSecondsDefaultsToSevenDays) {
+	ofstream os(test_config_fname);
+	os << R"({})";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_TRUE(ret) << ret.error().String();
+	EXPECT_EQ(mc.pause_before_timeout_seconds, 604800);
+}
+
+TEST_F(ConfigParserTests, PauseBeforeTimeoutSecondsRejectsNonInteger) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBeforeTimeoutSeconds": "3600" })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_FALSE(ret);
+	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::ValidationError, "").code);
+}
+
+TEST_F(ConfigParserTests, PauseBeforeTimeoutSecondsRejectsNonPositive) {
+	ofstream os(test_config_fname);
+	os << R"({ "PauseBeforeTimeoutSeconds": 0 })";
+	os.close();
+
+	config_parser::MenderConfigFromFile mc;
+	config_parser::ExpectedBool ret = mc.LoadFile(test_config_fname);
+	ASSERT_FALSE(ret);
+	EXPECT_EQ(ret.error().code, config_parser::MakeError(config_parser::ValidationError, "").code);
+}

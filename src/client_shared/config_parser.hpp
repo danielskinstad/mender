@@ -59,6 +59,7 @@ enum ConfigParserErrorCode {
 	NoError = 0,
 	ValidationError,
 	DeviceTierError,
+	PauseBeforeError,
 };
 
 class ConfigParserErrorCategoryClass : public std::error_category {
@@ -128,6 +129,9 @@ public:
 	/** Poll interval for checking for new updates */
 	int update_poll_interval_seconds = 1800;
 
+	/** Max seconds to hold a paused deployment before auto-aborting. Default 7 days */
+	int pause_before_timeout_seconds = 604800; // 7 * 24 * 60 * 60
+
 	/** Poll interval for periodically sending inventory data */
 	int inventory_poll_interval_seconds = 28800;
 
@@ -168,6 +172,10 @@ public:
 
 	/** Device tier classification */
 	string device_tier = device_tier::kStandard;
+
+	/** States to pause the deployment before. Valid values: "Download",
+		"ArtifactInstall", "ArtifactReboot", "ArtifactCommit". Empty = never pause. */
+	vector<string> pause_before;
 
 	/** List of available servers, to which client can fall over */
 	vector<string> servers;

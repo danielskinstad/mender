@@ -22,6 +22,19 @@
 #include <common/json.hpp>
 #include <common/log.hpp>
 
+namespace {
+using std::count;
+using std::string;
+using std::vector;
+
+const vector<string> kValidPauseBeforeStates = {
+	"Download", "ArtifactInstall", "ArtifactReboot", "ArtifactCommit"};
+
+bool IsValidPauseBeforeState(const string &state) {
+	return count(kValidPauseBeforeStates.begin(), kValidPauseBeforeStates.end(), state) > 0;
+}
+} // namespace
+
 namespace mender {
 namespace client_shared {
 namespace config_parser {
@@ -45,6 +58,10 @@ string ConfigParserErrorCategoryClass::message(int code) const {
 		return "Success";
 	case ValidationError:
 		return "Validation error";
+	case DeviceTierError:
+		return "Invalid DeviceTier value";
+	case PauseBeforeError:
+		return "Invalid PauseBefore value";
 	default:
 		return "Unknown";
 	}
@@ -387,6 +404,72 @@ ExpectedBool MenderConfigFromFile::LoadFile(const string &path) {
 			this->retry_download_count = e_cfg_int.value();
 			applied = true;
 		}
+	}
+
+	e_cfg_value = cfg_json.Get("PauseBefore");
+	if (e_cfg_value) {
+		this->pause_before.clear();
+		const json::Json value = e_cfg_value.value();
+
+		// Accept either a single state name ("PauseBefore": "ArtifactInstall") or a
+		// list ("PauseBefore": ["ArtifactInstall", ...]). Anything else is a hard
+		// error -- a misconfigured value must fail loudly, not silently disable
+		// pausing.
+		vector<string> candidates;
+		if (value.IsString()) {
+			candidates.push_back(value.GetString().value());
+		} else if (value.IsArray()) {
+			const json::ExpectedSize e_n_items = value.GetArraySize();
+			if (e_n_items) {
+				for (size_t i = 0; i < e_n_items.value(); i++) {
+					const json::ExpectedJson e_array_item = value.Get(i);
+					if (!e_array_item) {
+						continue;
+					}
+					const json::ExpectedString e_item_string = e_array_item.value().GetString();
+					if (!e_item_string) {
+						return expected::unexpected(MakeError(
+							ConfigParserErrorCode::PauseBeforeError,
+							"PauseBefore list entries must be strings"));
+					}
+					candidates.push_back(e_item_string.value());
+				}
+			}
+		} else {
+			return expected::unexpected(MakeError(
+				ConfigParserErrorCode::PauseBeforeError,
+				"PauseBefore must be a state name or a list of state names"));
+		}
+
+		for (const auto &item_value : candidates) {
+			if (!IsValidPauseBeforeState(item_value)) {
+				return expected::unexpected(MakeError(
+					ConfigParserErrorCode::PauseBeforeError,
+					"Invalid PauseBefore state: " + item_value));
+			}
+			this->pause_before.push_back(item_value);
+		}
+		applied = true;
+	}
+
+	e_cfg_value = cfg_json.Get("PauseBeforeTimeoutSeconds");
+	if (e_cfg_value) {
+		const json::Json value_json = e_cfg_value.value();
+		const auto e_cfg_int = value_json.Get<int>();
+		if (!e_cfg_int) {
+			// Present but not an integer -- fail loudly rather than silently keep
+			// the default (consistent with PauseBefore's strict handling).
+			return expected::unexpected(MakeError(
+				ConfigParserErrorCode::ValidationError,
+				"PauseBeforeTimeoutSeconds must be a positive integer number of seconds."));
+		}
+		if (e_cfg_int.value() <= 0) {
+			return expected::unexpected(MakeError(
+				ConfigParserErrorCode::ValidationError,
+				"PauseBeforeTimeoutSeconds must be a positive number of seconds."));
+		}
+		this->pause_before_timeout_seconds = e_cfg_int.value();
+		applied = true;
 	}
 
 	return applied;

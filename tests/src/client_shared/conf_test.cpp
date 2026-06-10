@@ -825,6 +825,38 @@ TEST(ConfTests, ProxyEnvironmentVariables) {
 	}
 }
 
+TEST(ConfTests, InvalidPauseBeforeIsFatalForDefaultPath) {
+	mtesting::TemporaryDirectory tmpdir;
+	string conf_file = path::Join(tmpdir.Path(), "mender.conf");
+	{
+		ofstream f(conf_file);
+		f << R"({ "PauseBefore": ["NopeState"] })";
+	}
+
+	conf::MenderConfig config;
+	// No --config: the file is loaded as a non-required default path.
+	config.paths.SetConfFile(conf_file);
+	vector<string> args {};
+	auto result = config.ProcessCmdlineArgs(args.begin(), args.end(), conf::CliApp {});
+	EXPECT_FALSE(result) << "Invalid PauseBefore on the default path must be fatal";
+}
+
+TEST(ConfTests, ValidPauseBeforeOnDefaultPathSucceeds) {
+	mtesting::TemporaryDirectory tmpdir;
+	string conf_file = path::Join(tmpdir.Path(), "mender.conf");
+	{
+		ofstream f(conf_file);
+		f << R"({ "PauseBefore": ["ArtifactInstall"] })";
+	}
+
+	conf::MenderConfig config;
+	config.paths.SetConfFile(conf_file);
+	vector<string> args {};
+	auto result = config.ProcessCmdlineArgs(args.begin(), args.end(), conf::CliApp {});
+	EXPECT_TRUE(result) << (result ? "" : result.error().String());
+	EXPECT_EQ(config.pause_before.size(), 1);
+}
+
 TEST(ConfTests, FallbackConfig) {
 	mtesting::TemporaryDirectory tmpdir;
 
